@@ -205,13 +205,14 @@ func getAuctionList(host string) (map[uint64]string, error) {
 }
 
 func getLocalCars(dbConn *pgx.Conn) ([]Car, error) {
+	fmt.Printf("Fetching local cars")
 	var cars []Car
 	rows, err := dbConn.Query(context.Background(), "SELECT id, car_id, seen FROM mogo WHERE sold=$1", false)
 	if err != nil {
 		log.Printf("Error while fetching from db: %v", err)
 		os.Exit(110)
 	}
-	rows.Close()
+	defer rows.Close()
 	for rows.Next() {
 		var car Car
 		if err := rows.Scan(&car.Id, &car.CarId, &car.Seen); err != nil {
@@ -299,6 +300,7 @@ func filterCars(dbConn *pgx.Conn, aucList map[uint64]string, localCars []Car) {
 			updateSeen(dbConn, &car)
 		}
 	}
+	fmt.Printf("After filter %v", aucList)
 }
 
 func main() {
@@ -314,7 +316,6 @@ func main() {
 	if err != nil {
 		fmt.Print(err.Error())
 	}
-	fmt.Printf("Locak cars %v", localCars)
 	var host string = "https://cars.mogo.co.ke"
 	aucList, err := getAuctionList(host)
 	if err != nil {
