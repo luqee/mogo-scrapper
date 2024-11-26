@@ -19,6 +19,7 @@ import (
 type Car struct {
 	Id           int64
 	CarId        uint64
+	Description  string
 	Make         string
 	Model        string
 	EngineCap    float64
@@ -106,14 +107,33 @@ func extractCarUrls(host string, root *html.Node, carUrls map[uint64]string) {
 
 func extractDetails(root *html.Node, car *Car) {
 	var details []string
+	// var descr string
 	var dfs func(*html.Node)
 	dfs = func(n *html.Node) {
 		if n.Type == html.ElementNode && n.Data == "div" {
 			for _, atr := range n.Attr {
 				if atr.Key == "class" && atr.Val == "font-bold" {
 					// get attributes
-					fmt.Println(n.FirstChild.Data)
 					details = append(details, n.FirstChild.Data)
+				}
+				if atr.Key == "class" && atr.Val == "[&_p]:text-body [&_p]:text-medium-dark [&_p]:overflow-hidden [&_p]:max-h-[366px] md:[&_p]:max-h-[264px] lg:[&_p]:max-h-[240px] my-6 md:my-8 lg:my-6" {
+					// get attributes
+					car.Description = n.FirstChild.FirstChild.Data
+					makePattern := regexp.MustCompile(`(?i)Make\s*-\s*(.+)\s*Model`)
+					modelPattern := regexp.MustCompile(`(?i)Model\s*-\s*(.+)\s*Manuf`)
+					makeMatch := makePattern.FindStringSubmatch(car.Description)
+					modelMatch := modelPattern.FindStringSubmatch(car.Description)
+					if len(makeMatch) > 1 {
+						car.Make = makeMatch[1]
+					} else {
+						fmt.Println("Make not found")
+					}
+
+					if len(modelMatch) > 1 {
+						car.Model = modelMatch[1]
+					} else {
+						fmt.Println("Model not found")
+					}
 				}
 			}
 		}
@@ -122,20 +142,44 @@ func extractDetails(root *html.Node, car *Car) {
 		}
 	}
 	dfs(root)
-	year, _ := strconv.Atoi(details[0])
-	car.Year = uint64(year)
-	car.BodyType = details[1]
-	car.Transmission = details[2]
-	car.FuelType = details[3]
-	re := regexp.MustCompile(`\d+(\.\d+)?`)
-	match := re.FindString(details[4])
-	cap, _ := strconv.ParseFloat(match, 64)
-	car.EngineCap = cap
-	re = regexp.MustCompile(`\d+`)
-	matches := re.FindAllString(details[5], -1)
-	miles, _ := strconv.Atoi(strings.Join(matches, ""))
-	car.Milage = uint64(miles)
-	car.Plate = details[6]
+	fmt.Printf("found these details for car %d \n%v\n", car.CarId, details)
+	if len(details) == 7 {
+		year, _ := strconv.Atoi(details[0])
+		car.Year = uint64(year)
+		car.BodyType = details[1]
+		car.Transmission = details[2]
+		car.FuelType = details[3]
+		re := regexp.MustCompile(`\d+(\.\d+)?`)
+		match := re.FindString(details[4])
+		cap, _ := strconv.ParseFloat(match, 64)
+		car.EngineCap = cap
+		re = regexp.MustCompile(`\d+`)
+		matches := re.FindAllString(details[5], -1)
+		miles, _ := strconv.Atoi(strings.Join(matches, ""))
+		car.Milage = uint64(miles)
+		car.Plate = details[6]
+	}
+}
+
+func extractPrice(root *html.Node, car *Car) {
+	var dfs func(*html.Node)
+	dfs = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "div" {
+			for _, atr := range n.Attr {
+				if atr.Key == "class" && atr.Val == "text-high-dark text-xl leading-8 font-semibold mt-0.5 order-2" {
+					// get attributes
+					priceRe := regexp.MustCompile(`\d+`)
+					match := priceRe.FindAllString(n.FirstChild.Data, -1)
+					price, _ := strconv.Atoi(strings.Join(match, ""))
+					car.Price = uint64(price)
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			dfs(c)
+		}
+	}
+	dfs(root)
 }
 
 func getAuctionList(host string) (map[uint64]string, error) {
@@ -147,15 +191,22 @@ func getAuctionList(host string) (map[uint64]string, error) {
 			fmt.Println(err)
 			break
 		}
+		fmt.Printf("Fetched page %d\n", pageNum)
+		carsGrid := findNode(res, "div", SearchAttr{Key: "class", Value: "grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-2 xl:grid-cols-3 xl:gap-8"})
+		if carsGrid == nil {
+			fmt.Printf("Reached past end. page: %d\n", pageNum)
+			break
+		}
 		extractCarUrls(host, res, fetchedUrls)
 		pageNum++
 	}
+	fmt.Printf("Finised getting list\n %v\n", fetchedUrls)
 	return fetchedUrls, nil
 }
 
 func getLocalCars(dbConn *pgx.Conn) ([]Car, error) {
 	var cars []Car
-	rows, err := dbConn.Query(context.Background(), "SELECT * FROM cars WHERE sold=?", 0)
+	rows, err := dbConn.Query(context.Background(), "SELECT id, car_id, seen FROM mogo WHERE sold=$1", false)
 	if err != nil {
 		log.Printf("Error while fetching from db: %v", err)
 		os.Exit(110)
@@ -163,7 +214,7 @@ func getLocalCars(dbConn *pgx.Conn) ([]Car, error) {
 	rows.Close()
 	for rows.Next() {
 		var car Car
-		if err := rows.Scan(&car.Id, &car.Make, &car.Model, &car.Price); err != nil {
+		if err := rows.Scan(&car.Id, &car.CarId, &car.Seen); err != nil {
 			log.Printf("Error while scanning results: %v", err)
 			os.Exit(111)
 		}
@@ -176,22 +227,48 @@ func getLocalCars(dbConn *pgx.Conn) ([]Car, error) {
 	return cars, nil
 }
 
-func saveCar(car *Car) (int64, error) {
+func saveCar(connObj *pgx.Conn, car *Car) (int64, error) {
 	var id int64
-	query := "INSERT INTO cars (carId, make, model, engineCap, transmission, fuelType, year, milage, plate, bodyType, price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id"
+	query := "INSERT INTO mogo (car_id, make, model, engine_cap, transmission, fuel_type, year, mileage, plate, body_type, price, description) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id"
 	err := connObj.QueryRow(
 		context.Background(),
 		query,
-		car.CarId, car.Make, car.Model, car.EngineCap, car.Transmission, car.FuelType, car.Year, car.Milage, car.Plate, car.BodyType, car.Price).Scan(&id)
+		car.CarId, car.Make, car.Model, car.EngineCap, car.Transmission, car.FuelType, car.Year, car.Milage, car.Plate, car.BodyType, car.Price, car.Description).Scan(&id)
 	if err != nil {
-		log.Printf("Error saving car")
-		return 0, fmt.Errorf("Error saving %v", err)
+		log.Printf("Error saving car %v", err)
+		return 0, fmt.Errorf("error saving %v", err)
 	}
 
 	return id, nil
 }
 
-func getCarsDeets(carsList map[uint64]string) error {
+func updateSold(dbConn *pgx.Conn, car *Car) {
+	var id int64
+	query := "UPDATE mogo SET sold=true WHERE id=$1 RETURNING id"
+	err := dbConn.QueryRow(
+		context.Background(),
+		query,
+		car.Id).Scan(&id)
+	if err != nil {
+		log.Printf("Error update car")
+	}
+	fmt.Printf("Updated %d", id)
+}
+
+func updateSeen(dbConn *pgx.Conn, car *Car) {
+	var id int64
+	query := "UPDATE mogo SET seen=$1 WHERE id=$2 RETURNING id"
+	err := dbConn.QueryRow(
+		context.Background(),
+		query,
+		car.Seen+1, car.Id).Scan(&id)
+	if err != nil {
+		log.Printf("Error updating car")
+	}
+	fmt.Printf("Updated %d", id)
+}
+
+func getCarsDeets(dbConn *pgx.Conn, carsList map[uint64]string) error {
 	var car Car
 	for carId, carUrl := range carsList {
 		res, err := fetchUrl(carUrl)
@@ -200,61 +277,62 @@ func getCarsDeets(carsList map[uint64]string) error {
 			continue
 		}
 		car = Car{CarId: carId}
-		aboutSection := findNode(res, "div", SearchAttr{Key: "class", Value: "vehicle-about__details"})
+		priceSection := findNode(res, "div", SearchAttr{Key: "class", Value: "ds-vehicle-card-pricings py-2 px-0 ds-vehicle-card-pricings--no-borders cp-vehicle-card-mogo"})
+		extractPrice(priceSection, &car)
+		aboutSection := findNode(res, "section", SearchAttr{Key: "class", Value: "vehicle-about"})
 		extractDetails(aboutSection, &car)
-		car.save()
+		saveCar(dbConn, &car)
 	}
 	return nil
 }
 
-func filterCars(aucList map[uint64]string, localCars []Car) {
+func filterCars(dbConn *pgx.Conn, aucList map[uint64]string, localCars []Car) {
 	for _, car := range localCars {
 		_, ok := aucList[car.CarId]
 		if !ok {
 			fmt.Println("Local Car not in list")
+			updateSold(dbConn, &car)
 			//update db car sold
 		} else {
-			//update seen
-			//remove from list
+			fmt.Println("Local Car in list")
 			delete(aucList, car.CarId)
+			updateSeen(dbConn, &car)
 		}
 	}
 }
 
-func crawlMogo(dbConn *pgx.Conn) {
+func main() {
+
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	conn := connect()
+	defer conn.Close(context.Background())
+	createTabe(conn)
+	localCars, err := getLocalCars(conn)
+	if err != nil {
+		fmt.Print(err.Error())
+	}
+	fmt.Printf("Locak cars %v", localCars)
 	var host string = "https://cars.mogo.co.ke"
 	aucList, err := getAuctionList(host)
 	if err != nil {
 		fmt.Print(err.Error())
 	}
-	// get cars in storage
-	localCars, err := getLocalCars(dbConn)
-	if err != nil {
-		fmt.Print(err.Error())
-	}
-	filterCars(aucList, localCars)
-	getCarsDeets(aucList)
+	filterCars(conn, aucList, localCars)
+	getCarsDeets(conn, aucList)
 
-}
-
-var connObj *pgx.Conn
-
-func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-
-	// dbConn := connect()
 	// crawlMogo(dbConn)
-	res, err := fetchUrl("https://cars.mogo.co.ke/auto/10771/nissan-caravan-2008")
-	if err != nil {
-		fmt.Println(err)
-	}
-	var car Car
-	aboutSection := findNode(res, "div", SearchAttr{Key: "class", Value: "vehicle-about__details"})
-	extractDetails(aboutSection, &car)
-	fmt.Printf("%v", car)
+	// res, err := fetchUrl("https://cars.mogo.co.ke/auto/10859/land-rover-range-rover-vogue-2005")
+	// if err != nil {
+	// 	fmt.Println(err)
+	// }
+	// var car Car
+	// aboutSection := findNode(res, "section", SearchAttr{Key: "class", Value: "vehicle-about"})
+	// extractDetails(aboutSection, &car)
+
+	// saveCar(conn, &car)
 	// aucList, err := getCarsList(dbConn)
 	// if err != nil {
 	// 	fmt.Print(err.Error())conn
@@ -268,12 +346,38 @@ func connect() *pgx.Conn {
 		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
 		os.Exit(1)
 	}
-	defer connObj.Close(context.Background())
-
 	pingErr := connObj.Ping(context.Background())
 	if pingErr != nil {
 		log.Fatal(pingErr)
 	}
 	fmt.Println("connected!")
 	return connObj
+
+}
+
+func createTabe(connObj *pgx.Conn) {
+	query := `CREATE TABLE IF NOT EXISTS mogo (
+		id SERIAL PRIMARY KEY,
+		car_id int UNIQUE NOT NULL,
+		make VARCHAR(100) NOT NULL,
+		model VARCHAR(100) NOT NULL,
+		year int NOT NULL,
+		mileage int NOT NULL,
+		transmission VARCHAR(100) NOT NULL,
+		engine_cap NUMERIC(3,1) NOT NULL,
+		fuel_type VARCHAR(50) NOT NULL,
+		plate VARCHAR(50) NOT NULL,
+		body_type VARCHAR(50) NOT NULL,
+		price int NOT NULL,
+		seen int DEFAULT 1,
+		sold BOOLEAN DEFAULT false,
+		description VARCHAR(500) NOT NULL,
+		created timestamp DEFAULT NOW()
+	)`
+	_, err := connObj.Exec(context.Background(), query)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to create tabke : %v\n", err)
+		os.Exit(1)
+	}
+
 }
