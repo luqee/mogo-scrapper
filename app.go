@@ -105,7 +105,7 @@ func extractCarUrls(host string, root *html.Node, carUrls map[uint64]string) {
 	dfs(root)
 }
 
-func extractDetails(root *html.Node, car *Car) {
+func extractDetails(root *html.Node, car *Car) error {
 	var details []string
 	// var descr string
 	var dfs func(*html.Node)
@@ -158,7 +158,9 @@ func extractDetails(root *html.Node, car *Car) {
 		miles, _ := strconv.Atoi(strings.Join(matches, ""))
 		car.Milage = uint64(miles)
 		car.Plate = details[6]
+		return nil
 	}
+	return errors.New("Insufficient fields")
 }
 
 func extractPrice(root *html.Node, car *Car) {
@@ -200,7 +202,6 @@ func getAuctionList(host string) (map[uint64]string, error) {
 		extractCarUrls(host, res, fetchedUrls)
 		pageNum++
 	}
-	fmt.Printf("Finised getting list\n %v\n", fetchedUrls)
 	return fetchedUrls, nil
 }
 
@@ -244,29 +245,35 @@ func saveCar(connObj *pgx.Conn, car *Car) (int64, error) {
 }
 
 func updateSold(dbConn *pgx.Conn, car *Car) {
-	var id int64
-	query := "UPDATE mogo SET sold=true WHERE id=$1 RETURNING id"
-	err := dbConn.QueryRow(
+	query := "UPDATE mogo SET sold=true WHERE id=$1"
+	cmdTag, err := dbConn.Exec(
 		context.Background(),
 		query,
-		car.Id).Scan(&id)
+		car.Id)
 	if err != nil {
-		log.Printf("Error update car")
+		log.Printf("Error update car %v\n", err)
 	}
-	fmt.Printf("Updated %d", id)
+	if cmdTag.RowsAffected() != 1 {
+		log.Printf("No row found to update for %v\n", car.CarId)
+	} else {
+		log.Printf("Updated car %v\n", car.CarId)
+	}
 }
 
 func updateSeen(dbConn *pgx.Conn, car *Car) {
-	var id int64
-	query := "UPDATE mogo SET seen=$1 WHERE id=$2 RETURNING id"
-	err := dbConn.QueryRow(
+	query := "UPDATE mogo SET seen=$1 WHERE id=$2"
+	cmdTag, err := dbConn.Exec(
 		context.Background(),
 		query,
-		car.Seen+1, car.Id).Scan(&id)
+		car.Seen+1, car.Id)
 	if err != nil {
-		log.Printf("Error updating car")
+		log.Printf("Error updating car %v\n", err)
 	}
-	fmt.Printf("Updated %d", id)
+	if cmdTag.RowsAffected() != 1 {
+		log.Printf("No row found to update for %v\n", car.CarId)
+	} else {
+		log.Printf("Updated car %v\n", car.CarId)
+	}
 }
 
 func getCarsDeets(dbConn *pgx.Conn, carsList map[uint64]string) error {
@@ -281,8 +288,12 @@ func getCarsDeets(dbConn *pgx.Conn, carsList map[uint64]string) error {
 		priceSection := findNode(res, "div", SearchAttr{Key: "class", Value: "ds-vehicle-card-pricings py-2 px-0 ds-vehicle-card-pricings--no-borders cp-vehicle-card-mogo"})
 		extractPrice(priceSection, &car)
 		aboutSection := findNode(res, "section", SearchAttr{Key: "class", Value: "vehicle-about"})
-		extractDetails(aboutSection, &car)
-		saveCar(dbConn, &car)
+		err = extractDetails(aboutSection, &car)
+		if err != nil {
+			log.Printf("%s", err)
+		} else {
+			saveCar(dbConn, &car)
+		}
 	}
 	return nil
 }
@@ -291,16 +302,14 @@ func filterCars(dbConn *pgx.Conn, aucList map[uint64]string, localCars []Car) {
 	for _, car := range localCars {
 		_, ok := aucList[car.CarId]
 		if !ok {
-			fmt.Println("Local Car not in list")
 			updateSold(dbConn, &car)
 			//update db car sold
 		} else {
-			fmt.Println("Local Car in list")
 			delete(aucList, car.CarId)
 			updateSeen(dbConn, &car)
 		}
 	}
-	fmt.Printf("After filter %v", aucList)
+	fmt.Printf("After filter %v\n", aucList)
 }
 
 func main() {
@@ -372,7 +381,7 @@ func createTabe(connObj *pgx.Conn) {
 		price int NOT NULL,
 		seen int DEFAULT 1,
 		sold BOOLEAN DEFAULT false,
-		description VARCHAR(500) NOT NULL,
+		description TEXT NOT NULL,
 		created timestamp DEFAULT NOW()
 	)`
 	_, err := connObj.Exec(context.Background(), query)
